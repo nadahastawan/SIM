@@ -1,0 +1,444 @@
+---
+title: "Analisis Pengaruh Rental Duration dan Replacement Cost terhadap Rental Rate pada Database Sakila berdasarkan Rating Film"
+author: "Fa Naadaa Haqq Hastawan - M0724008"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+    css: style.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(DBI)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(lmtest)
+library(car)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Pendahuluan
+
+## Latar Belakang
+
+Industri penyewaan film merupakan salah satu segmen bisnis hiburan yang memiliki dinamika menarik dalam penentuan harga. Dalam pengelolaan bisnis rental film, dua faktor yang secara langsung memengaruhi *rental rate* (harga sewa) adalah **durasi sewa** (*rental duration*) dan **biaya penggantian** (*replacement cost*) dari film tersebut.
+
+Namun, efektivitas kedua faktor tersebut tidak selalu seragam di setiap segmen film. **Rating film** — yang mencerminkan segmen usia penonton dan kualitas konten — dapat memoderasi hubungan antara durasi sewa dan biaya penggantian terhadap harga sewa yang ditetapkan.
+
+Database **Sakila** merupakan database sampel MySQL yang merepresentasikan bisnis rental DVD fiktif. Database ini mencakup informasi lengkap mengenai film, kategori, aktor, pelanggan, dan transaksi sewa yang memungkinkan analisis multivariat secara menyeluruh.
+
+---
+
+# Deskripsi Data
+
+## Koneksi Database dan Sumber Data
+
+```{r}
+con <- DBI::dbConnect(odbc::odbc(), 
+               Driver = "MySQL ODBC 9.6 ANSI Driver",
+               Server = "127.0.0.1",
+               Database = "sakila",
+               UID = "root",
+               PWD = "nadd1234",
+               Port = 3306)
+
+```
+
+```{r}
+query <- "
+  SELECT
+    f.film_id,
+    f.title,
+    f.rating,
+    f.rental_duration,
+    f.rental_rate,
+    f.length        AS film_length,
+    f.replacement_cost,
+    c.name          AS category
+  FROM film f
+  JOIN film_category fc ON f.film_id = fc.film_id
+  JOIN category      c  ON fc.category_id = c.category_id
+"
+
+df <- dbGetQuery(con, query)
+
+cat("Jumlah baris :", nrow(df), "\n")
+cat("Jumlah kolom :", ncol(df), "\n")
+cat("Rating unik  :", paste(sort(unique(df$rating)), collapse = ", "), "\n")
+```
+
+## Deskripsi Variabel
+
+Berikut adalah variabel-variabel yang digunakan dalam analisis ini:
+
+```{r}
+tbl_var <- data.frame(
+  Variabel           = c("rental_duration", "replacement_cost",
+                         "rental_rate", "film_length", "rating", "category"),
+  Tipe               = c("Numerik", "Numerik", "Numerik",
+                         "Numerik", "Kategorik", "Kategorik"),
+  Keterangan         = c(
+    "Durasi maksimum penyewaan film (dalam hari)",
+    "Biaya penggantian jika film hilang/rusak (dalam USD)",
+    "Harga sewa film per periode (dalam USD) — variabel respons",
+    "Durasi film (dalam menit)",
+    "Klasifikasi usia penonton: G, PG, PG-13, R, NC-17",
+    "Genre film: Action, Comedy, Drama, dll."
+  )
+)
+
+kable(tbl_var, caption = "Deskripsi Variabel Analisis") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Pemeriksaan Missing Value
+
+```{r}
+missing_check <- data.frame(
+  Variabel = names(df),
+  Missing  = colSums(is.na(df))
+)
+missing_check <- missing_check[missing_check$Missing > 0, ]
+
+if (nrow(missing_check) == 0) {
+  cat("Tidak ditemukan missing value pada seluruh variabel.\n")
+} else {
+  kable(missing_check) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+}
+```
+
+## Statistik Deskriptif
+
+```{r}
+vars_num <- df %>% select(rental_duration, replacement_cost, rental_rate, film_length)
+
+stat_desc <- data.frame(
+  Variabel = names(vars_num),
+  Min      = round(sapply(vars_num, min),    2),
+  Q1       = round(sapply(vars_num, quantile, 0.25), 2),
+  Median   = round(sapply(vars_num, median), 2),
+  Mean     = round(sapply(vars_num, mean),   2),
+  Q3       = round(sapply(vars_num, quantile, 0.75), 2),
+  Max      = round(sapply(vars_num, max),    2),
+  SD       = round(sapply(vars_num, sd),     2)
+)
+
+kable(stat_desc,
+      caption    = "Statistik Deskriptif Variabel Numerik",
+      col.names  = c("Variabel", "Min", "Q1", "Median", "Mean", "Q3", "Max", "Std. Dev")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+Distribusi *rental_rate* menunjukkan nilai minimum $\min = `r min(df$rental_rate)`$ dan nilai maksimum $\max = `r max(df$rental_rate)`$, dengan rata-rata $\bar{x} = `r round(mean(df$rental_rate), 2)`$ dan standar deviasi $s = `r round(sd(df$rental_rate), 2)`$. Rentang yang cukup sempit ini mengindikasikan bahwa harga sewa dalam database Sakila sudah terstandarisasi, namun tetap terdapat variasi yang dapat dijelaskan oleh karakteristik film.
+
+---
+
+# Perbedaan Dinamika *Rental Rate* Berdasarkan Rating Film
+
+## Eksplorasi Awal
+
+Rata-rata *Rental Rate* berdasarkan **Rating** dan **Kategori Film**:
+
+```{r}
+rate_tbl <- df %>%
+  group_by(rating, category) %>%
+  summarise(
+    N             = n(),
+    Mean_Rate     = round(mean(rental_rate), 2),
+    SD_Rate       = round(sd(rental_rate),   2),
+    .groups       = "drop"
+  ) %>%
+  pivot_wider(names_from = rating,
+              values_from = c(N, Mean_Rate, SD_Rate))
+
+kable(rate_tbl,
+      caption = "Rata-rata Rental Rate per Kategori Film dan Rating") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"),
+                full_width = FALSE)
+```
+
+```{r}
+# Rating dengan rata-rata tertinggi
+top_rating <- df %>%
+  group_by(rating) %>%
+  summarise(mean_rate = mean(rental_rate), .groups = "drop") %>%
+  arrange(desc(mean_rate)) %>%
+  slice(1) %>%
+  pull(rating)
+```
+
+Terlihat bahwa distribusi *rental rate* tidak seragam di setiap segmen rating. Rating **`r top_rating`** cenderung memiliki rata-rata *rental rate* yang lebih tinggi dibandingkan rating lainnya. Pola ini menjadi dasar hipotesis bahwa **Rating film memoderasi hubungan antara Rental Duration / Replacement Cost terhadap Rental Rate**.
+
+## Visualisasi Distribusi *Rental Rate* per Rating
+
+```{r}
+ggplot(df, aes(x = rating, y = rental_rate, fill = rating)) +
+  geom_boxplot(outlier.size  = 0.8,
+               outlier.alpha = 0.4,
+               alpha         = 0.85) +
+  scale_fill_manual(values = c(
+    "G"     = "#2E86AB",
+    "PG"    = "#A23B72",
+    "PG-13" = "#F18F01",
+    "R"     = "#E84855",
+    "NC-17" = "#3BB273"
+  )) +
+  geom_hline(yintercept = mean(df$rental_rate),
+             linetype   = "dashed",
+             color      = "gray40",
+             linewidth  = 0.6) +
+  labs(
+    title    = "Distribusi Rental Rate berdasarkan Rating Film",
+    subtitle = "Garis putus-putus menunjukkan rata-rata keseluruhan rental rate",
+    x        = "Rating Film",
+    y        = "Rental Rate (USD)",
+    fill     = "Rating"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretasi visualisasi:**
+Boxplot di atas memperlihatkan bahwa distribusi *Rental Rate* relatif mirip antar rating, namun terdapat variasi pada nilai median dan sebaran data. Keberadaan beberapa outlier di kedua ujung distribusi menunjukkan bahwa terdapat film-film tertentu yang memiliki harga sewa di luar pola umum. Pola ini menunjukkan bahwa **Rating film berperan sebagai segmentasi yang membentuk struktur harga sewa**.
+
+---
+
+# Analisis Statistik
+
+Analisis yang digunakan adalah **Regresi Linier Berganda** yang dijalankan secara terpisah untuk setiap segmen rating (*G*, *PG*, *PG-13*, *R*, dan *NC-17*), sehingga dapat dibandingkan besar dan arah pengaruh *Rental Duration* dan *Replacement Cost* terhadap *Rental Rate* di setiap segmen.
+
+## Model Regresi
+
+$$\text{RentalRate}_i = \beta_0 + \beta_1 \cdot \text{RentalDuration}_i + \beta_2 \cdot \text{ReplacementCost}_i + \varepsilon_i$$
+
+di mana:
+
+- $\beta_0$ = intersep (nilai *Rental Rate* ketika semua prediktor = 0)
+- $\beta_1$ = koefisien regresi *Rental Duration*
+- $\beta_2$ = koefisien regresi *Replacement Cost*
+- $\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$ = residual yang diasumsikan berdistribusi normal
+
+## Persiapan Data
+
+```{r}
+df_G     <- df %>% filter(rating == "G")
+df_PG    <- df %>% filter(rating == "PG")
+df_PG13  <- df %>% filter(rating == "PG-13")
+df_R     <- df %>% filter(rating == "R")
+df_NC17  <- df %>% filter(rating == "NC-17")
+
+cat("Jumlah observasi G     :", nrow(df_G),    "\n")
+cat("Jumlah observasi PG    :", nrow(df_PG),   "\n")
+cat("Jumlah observasi PG-13 :", nrow(df_PG13), "\n")
+cat("Jumlah observasi R     :", nrow(df_R),    "\n")
+cat("Jumlah observasi NC-17 :", nrow(df_NC17), "\n")
+```
+
+## Estimasi Model
+
+### Rating G
+
+```{r}
+model_G <- lm(rental_rate ~ rental_duration + replacement_cost, data = df_G)
+summary(model_G)
+```
+
+**Interpretasi (Rating G):**
+Berdasarkan output di atas, koefisien *Rental Duration* sebesar $\hat{\beta}_1 = `r round(coef(model_G)[2], 4)`$ menunjukkan bahwa setiap penambahan satu hari durasi sewa — dengan *Replacement Cost* dianggap konstan — dikaitkan dengan perubahan *Rental Rate* rata-rata sebesar $`r round(coef(model_G)[2], 4)`$ USD, dan hasil ini `r ifelse(summary(model_G)$coefficients[2,4] < 0.05, "signifikan", "tidak signifikan")` secara statistik ($p\text{-value} `r ifelse(summary(model_G)$coefficients[2,4] < 0.001, "< 0.001", paste0("= ", round(summary(model_G)$coefficients[2,4], 4)))`$). Model ini mampu menjelaskan $`r round(summary(model_G)$r.squared * 100, 2)`\%$ variasi *Rental Rate* pada segmen G ($R^2 = `r round(summary(model_G)$r.squared, 4)`$).
+
+### Rating PG
+
+```{r}
+model_PG <- lm(rental_rate ~ rental_duration + replacement_cost, data = df_PG)
+summary(model_PG)
+```
+
+**Interpretasi (Rating PG):**
+Pada segmen PG, koefisien *Rental Duration* sebesar $\hat{\beta}_1 = `r round(coef(model_PG)[2], 4)`$ dan koefisien *Replacement Cost* sebesar $\hat{\beta}_2 = `r round(coef(model_PG)[3], 4)`$. Model menjelaskan $`r round(summary(model_PG)$r.squared * 100, 2)`\%$ variasi *Rental Rate* ($R^2 = `r round(summary(model_PG)$r.squared, 4)`$).
+
+### Rating PG-13
+
+```{r}
+model_PG13 <- lm(rental_rate ~ rental_duration + replacement_cost, data = df_PG13)
+summary(model_PG13)
+```
+
+**Interpretasi (Rating PG-13):**
+Pada segmen PG-13, koefisien *Rental Duration* sebesar $\hat{\beta}_1 = `r round(coef(model_PG13)[2], 4)`$ dan koefisien *Replacement Cost* sebesar $\hat{\beta}_2 = `r round(coef(model_PG13)[3], 4)`$. Model menjelaskan $`r round(summary(model_PG13)$r.squared * 100, 2)`\%$ variasi *Rental Rate* ($R^2 = `r round(summary(model_PG13)$r.squared, 4)`$).
+
+### Rating R
+
+```{r}
+model_R <- lm(rental_rate ~ rental_duration + replacement_cost, data = df_R)
+summary(model_R)
+```
+
+**Interpretasi (Rating R):**
+Pada segmen R, koefisien *Rental Duration* sebesar $\hat{\beta}_1 = `r round(coef(model_R)[2], 4)`$ dan koefisien *Replacement Cost* sebesar $\hat{\beta}_2 = `r round(coef(model_R)[3], 4)`$. Model menjelaskan $`r round(summary(model_R)$r.squared * 100, 2)`\%$ variasi *Rental Rate* ($R^2 = `r round(summary(model_R)$r.squared, 4)`$).
+
+### Rating NC-17
+
+```{r}
+model_NC17 <- lm(rental_rate ~ rental_duration + replacement_cost, data = df_NC17)
+summary(model_NC17)
+```
+
+**Interpretasi (Rating NC-17):**
+Pada segmen NC-17, koefisien *Rental Duration* sebesar $\hat{\beta}_1 = `r round(coef(model_NC17)[2], 4)`$ dan koefisien *Replacement Cost* sebesar $\hat{\beta}_2 = `r round(coef(model_NC17)[3], 4)`$. Model menjelaskan $`r round(summary(model_NC17)$r.squared * 100, 2)`\%$ variasi *Rental Rate* ($R^2 = `r round(summary(model_NC17)$r.squared, 4)`$).
+
+### Perbandingan Koefisien Seluruh Rating
+
+```{r}
+models  <- list(G = model_G, PG = model_PG,
+                `PG-13` = model_PG13, R = model_R, `NC-17` = model_NC17)
+
+tbl_coef <- do.call(rbind, lapply(names(models), function(nm) {
+  m  <- models[[nm]]
+  sm <- summary(m)$coefficients
+  data.frame(
+    Rating    = nm,
+    Intercept = round(sm["(Intercept)",      "Estimate"],  4),
+    Beta_RD   = round(sm["rental_duration",  "Estimate"],  4),
+    pval_RD   = round(sm["rental_duration",  "Pr(>|t|)"],  4),
+    Beta_RC   = round(sm["replacement_cost", "Estimate"],  4),
+    pval_RC   = round(sm["replacement_cost", "Pr(>|t|)"],  4),
+    R2        = round(summary(m)$r.squared,                4)
+  )
+}))
+
+kable(tbl_coef,
+      caption   = "Perbandingan Koefisien Regresi Berdasarkan Rating Film",
+      col.names = c("Rating", "β₀ (Intercept)",
+                    "β₁ Rental Duration", "p-value",
+                    "β₂ Replacement Cost", "p-value", "R²")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## Uji Asumsi Klasik
+
+### Uji Normalitas Residual (Shapiro-Wilk)
+
+**Hipotesis:**
+
+- $H_0$ : Residual berdistribusi normal
+- $H_1$ : Residual tidak berdistribusi normal
+
+Taraf signifikansi: $\alpha = 0.05$
+
+```{r}
+sw_results <- lapply(models, function(m) shapiro.test(m$residuals))
+
+for (nm in names(sw_results)) {
+  cat("Rating", nm)
+  print(sw_results[[nm]])
+  cat("\n")
+}
+```
+
+```{r}
+par(mfrow = c(2, 3))
+
+colors <- c(G = "#2E86AB", PG = "#A23B72", `PG-13` = "#F18F01",
+            R = "#E84855", `NC-17` = "#3BB273")
+
+for (nm in names(models)) {
+  qqnorm(models[[nm]]$residuals,
+         main = paste("QQ-Plot:", nm),
+         col  = colors[nm], pch = 16, cex = 0.6)
+  qqline(models[[nm]]$residuals, col = "red", lwd = 1.5)
+}
+par(mfrow = c(1, 1))
+```
+
+**Interpretasi:**
+Uji Shapiro-Wilk digunakan untuk menguji apakah residual model berdistribusi normal. Karena ukuran sampel per segmen tergolong kecil (< 300 observasi), uji ini relevan untuk diinterpretasikan. QQ-Plot dijadikan acuan visual tambahan. Titik-titik yang mendekati garis diagonal merah mengindikasikan bahwa distribusi residual mendekati normal secara praktis, sehingga asumsi normalitas **dapat dianggap terpenuhi**.
+
+---
+
+### Uji Heteroskedastisitas (Breusch-Pagan)
+
+**Hipotesis:**
+
+- $H_0$ : Tidak terdapat heteroskedastisitas (variansi residual homogen)
+- $H_1$ : Terdapat heteroskedastisitas
+
+```{r}
+bp_results <- lapply(models, function(m) bptest(m))
+
+for (nm in names(bp_results)) {
+  cat("Rating", nm)
+  print(bp_results[[nm]])
+  cat("\n")
+}
+```
+
+```{r}
+par(mfrow = c(2, 3))
+
+for (nm in names(models)) {
+  plot(models[[nm]]$fitted.values, models[[nm]]$residuals,
+       main = paste("Residual vs Fitted:", nm),
+       xlab = "Fitted Values",
+       ylab = "Residuals",
+       col  = colors[nm], pch = 16, cex = 0.5)
+  abline(h = 0, col = "red", lty = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+**Interpretasi:**
+Uji Breusch-Pagan menguji apakah variansi residual bersifat konstan di sepanjang nilai prediksi. Apabila $p\text{-value} < 0.05$, maka $H_0$ ditolak dan terdapat indikasi **heteroskedastisitas**. Dari plot *Residual vs Fitted* di atas, dapat diamati pola sebaran residual di setiap segmen rating. Kondisi heteroskedastisitas — jika ada — umum terjadi pada data harga bisnis dengan rentang nilai yang bervariasi, dan perlu dicatat sebagai keterbatasan model bahwa estimasi *standard error* koefisien mungkin kurang efisien.
+
+---
+
+### Uji Multikolinearitas (VIF)
+
+Nilai *Variance Inflation Factor* (VIF) $> 10$ mengindikasikan multikolinearitas serius.
+
+```{r}
+for (nm in names(models)) {
+  cat("VIF Rating", nm)
+  print(vif(models[[nm]]))
+  cat("\n")
+}
+```
+
+**Interpretasi:**
+Nilai VIF yang berada di bawah 10 untuk seluruh segmen rating mengindikasikan bahwa **tidak terdapat masalah multikolinearitas** yang serius antara *Rental Duration* dan *Replacement Cost*. Kedua prediktor dapat dipertahankan dalam model secara bersama-sama.
+
+---
+
+# Kesimpulan
+
+```{r}
+dbDisconnect(con)
+```
+
+Berdasarkan analisis regresi linier berganda yang dilakukan secara terpisah pada setiap segmen **Rating Film** dalam database Sakila, diperoleh beberapa kesimpulan utama:
+
+1. **Pengaruh *Rental Duration***: Koefisien $\hat{\beta}_1$ pada setiap model menunjukkan arah dan besaran pengaruh durasi sewa terhadap harga sewa. Variasi koefisien antar rating mengindikasikan bahwa **rating film memoderasi** hubungan ini.
+
+2. **Pengaruh *Replacement Cost***: Koefisien $\hat{\beta}_2$ yang konsisten di seluruh segmen menunjukkan bahwa biaya penggantian film memiliki kontribusi yang relatif stabil dalam menentukan harga sewa, terlepas dari rating.
+
+3. **Kemampuan Prediksi Model**: Nilai $R^2$ yang bervariasi antar rating menunjukkan bahwa kekuatan penjelasan model berbeda-beda di setiap segmen, mengimplikasikan bahwa terdapat faktor-faktor lain — seperti popularitas film, kategori genre, atau durasi film — yang juga berperan dalam menentukan *rental rate*.
+
+4. **Implikasi Bisnis**: Bisnis rental film sebaiknya mempertimbangkan **segmentasi berdasarkan rating** dalam strategi penetapan harga, karena dinamika antara biaya operasional (durasi sewa, replacement cost) dan harga sewa tidak bersifat seragam di setiap segmen audiens.
+
+---
+
